@@ -472,6 +472,15 @@ void AppSettings::updateUiByNvsParam(void)
 
 esp_err_t AppSettings::initWifi()
 {
+    static int s_wifi_init_count = 0;
+    static bool s_wifi_inited = false;
+    s_wifi_init_count++;
+    ESP_LOGI(TAG, "initWifi called count=%d", s_wifi_init_count);
+    if (s_wifi_inited) {
+        ESP_LOGW(TAG, "initWifi already initialized, skip");
+        return ESP_OK;
+    }
+    s_wifi_inited = true;
     s_wifi_event_group = xEventGroupCreate();
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_CONNECTED);
     xEventGroupClearBits(s_wifi_event_group, WIFI_EVENT_INIT_DONE);
