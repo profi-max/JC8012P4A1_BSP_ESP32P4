@@ -94,6 +94,11 @@
  
  bool Camera::run(void)
  {
+     if (_camera_ctlr_handle < 0) {
+         ESP_LOGE(TAG, "Camera device not available (no sensor detected), skip camera run");
+         return false;
+     }
+ 
      if (_camera_init_sem == NULL) {
          _camera_init_sem = xSemaphoreCreateBinary();
          assert(_camera_init_sem != NULL);
@@ -242,8 +247,12 @@
      xEventGroupClearBits(camera_event_group, CAMERA_EVENT_PED_DETECT);
      xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
      
-     app_video_stream_task_stop(_camera_ctlr_handle);
-     app_video_stream_wait_stop();
+     if (_camera_ctlr_handle < 0) {
+         ESP_LOGW(TAG, "Camera device not available (no sensor detected), skip stream stop");
+     } else {
+         app_video_stream_task_stop(_camera_ctlr_handle);
+         app_video_stream_wait_stop();
+     }
  
      if (_img_album_buffer) {
          heap_caps_free(_img_album_buffer);
@@ -271,7 +280,14 @@
      xEventGroupClearBits(camera_event_group, CAMERA_EVENT_HUMAN_DETECT);
  
      i2c_master_bus_handle_t i2c_bus_handle = bsp_i2c_get_handle();
-     esp_err_t ret = app_video_main(i2c_bus_handle);
+     esp_err_t ret = ESP_FAIL;
+     for (int attempt = 0; attempt < 3 && ret != ESP_OK; attempt++) {
+         if (attempt > 0) {
+             ESP_LOGW(TAG, "video main init retry %d/2 (wait 200ms)", attempt);
+             vTaskDelay(pdMS_TO_TICKS(200));
+         }
+         ret = app_video_main(i2c_bus_handle);
+     }
      if (ret != ESP_OK) {
          ESP_LOGE(TAG, "video main init failed with error 0x%x", ret);
      }
@@ -281,10 +297,47 @@
      if (_camera_ctlr_handle < 0) {
          ESP_LOGE(TAG, "video cam open failed");
  
-         if (ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, 100) || ESP_OK == i2c_master_probe(i2c_bus_handle, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP, 100)) {
-             ESP_LOGI(TAG, "gt911 touch found");
-         } else {
-             ESP_LOGE(TAG, "Touch not found");
+         ESP_LOGW(TAG, "I2C bus scan (0x20-0x77, 20ms probe):");
+         for (uint8_t saddr = 0x20; saddr <= 0x77; saddr++) {
+             if (ESP_OK == i2c_master_probe(i2c_bus_handle, saddr, 20)) {
+                 ESP_LOGW(TAG, "  found device at 0x%02x", saddr);
+             }
+         }
+
+         // Diagnostic: read 0x36 device ID with multiple register addressing schemes
+         if (ESP_OK == i2c_master_probe(i2c_bus_handle, 0x36, 20)) {
+             i2c_master_dev_handle_t dbg_dev = NULL;
+             i2c_device_config_t dbg_cfg = {
+                 .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                 .device_address = 0x36,
+                 .scl_speed_hz = 100000,
+             };
+             if (ESP_OK == i2c_master_bus_add_device(i2c_bus_handle, &dbg_cfg, &dbg_dev)) {
+                 uint8_t reg8 = 0, val8 = 0;
+                 for (uint8_t r = 0xf0; r <= 0xf1; r++) {
+                     reg8 = r;
+                     if (ESP_OK == i2c_master_transmit_receive(dbg_dev, &reg8, 1, &val8, 1, 50)) {
+                         ESP_LOGW(TAG, "  0x36 reg8 0x%02x = 0x%02x", r, val8);
+                     } else {
+                         ESP_LOGW(TAG, "  0x36 reg8 0x%02x read fail", r);
+                     }
+                 }
+                 uint8_t reg16[2] = {0, 0};
+                 for (int i = 0; i < 4; i++) {
+                     switch (i) {
+                     case 0: reg16[0] = 0x31; reg16[1] = 0x07; break;
+                     case 1: reg16[0] = 0x31; reg16[1] = 0x08; break;
+                     case 2: reg16[0] = 0x30; reg16[1] = 0x0a; break;
+                     default: reg16[0] = 0x30; reg16[1] = 0x0b; break;
+                     }
+                     if (ESP_OK == i2c_master_transmit_receive(dbg_dev, reg16, 2, &val8, 1, 50)) {
+                         ESP_LOGW(TAG, "  0x36 reg16 0x%02x%02x = 0x%02x", reg16[0], reg16[1], val8);
+                     } else {
+                         ESP_LOGW(TAG, "  0x36 reg16 0x%02x%02x read fail", reg16[0], reg16[1]);
+                     }
+                 }
+                 i2c_master_bus_rm_device(dbg_dev);
+             }
          }
      }
      ppa_client_config_t ppa_srm_config = {
@@ -353,10 +406,22 @@
  
  void Camera::taskCameraInit(Camera *app)
  {
-     ESP_ERROR_CHECK(app_video_set_bufs(app->_camera_ctlr_handle, EXAMPLE_CAM_BUF_NUM, (const void **)app->_cam_buffer));
+     esp_err_t ret = app_video_set_bufs(app->_camera_ctlr_handle, EXAMPLE_CAM_BUF_NUM, (const void **)app->_cam_buffer);
+     if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "camera not available, set bufs failed (0x%x), skip camera init", ret);
+         xSemaphoreGive(app->_camera_init_sem);
+         vTaskDelete(NULL);
+         return;
+     }
  
      ESP_LOGI(TAG, "Start camera stream task");
-     ESP_ERROR_CHECK(app_video_stream_task_start(app->_camera_ctlr_handle, 0));
+     ret = app_video_stream_task_start(app->_camera_ctlr_handle, 0);
+     if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "start camera stream task failed (0x%x), skip camera init", ret);
+         xSemaphoreGive(app->_camera_init_sem);
+         vTaskDelete(NULL);
+         return;
+     }
  
      xSemaphoreGive(app->_camera_init_sem);
  

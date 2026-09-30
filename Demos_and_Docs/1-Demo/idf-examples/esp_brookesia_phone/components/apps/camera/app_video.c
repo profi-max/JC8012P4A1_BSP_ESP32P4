@@ -394,6 +394,10 @@ errout:
 
 esp_err_t app_video_stream_task_stop(int video_fd)
 {
+    if (app_camera_video.video_event_group == NULL) {
+        ESP_LOGW(TAG, "video event group not created (stream never started), skip stop");
+        return ESP_OK;
+    }
     xEventGroupSetBits(app_camera_video.video_event_group, VIDEO_TASK_DELETE);
 
     return ESP_OK;
@@ -408,6 +412,10 @@ esp_err_t app_video_register_frame_operation_cb(app_video_frame_operation_cb_t o
 
 esp_err_t app_video_stream_wait_stop(void)
 {
+    if (app_camera_video.video_event_group == NULL) {
+        ESP_LOGW(TAG, "video event group not created (stream never started), skip wait stop");
+        return ESP_OK;
+    }
     xEventGroupWaitBits(app_camera_video.video_event_group, VIDEO_TASK_DELETE_DONE, pdTRUE, pdTRUE, portMAX_DELAY);
 
     ESP_LOGI(TAG, "Video Stream Task Stopped Done");
